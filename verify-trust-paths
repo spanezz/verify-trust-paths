@@ -5,6 +5,7 @@ import argparse
 import requests
 import tempfile
 import subprocess
+import shutil
 import shlex
 import os
 import re
@@ -34,27 +35,35 @@ class Verify:
         result = proc.wait()
         if result != 0:
             raise RuntimeError("{} exited with status {}: {}".format(
-                " ".join(shlex.quote(x) for x in self.base_cmd + args),
+                " ".join(shlex.quote(x) for x in cmd),
                 result,
                 stderr.strip()
             ))
         return stdout
 
-    def recv(self):
-        all_keyids = set()
-        for path in self.all_paths:
-            all_keyids.update(path)
+    def run_hkt(self, args, input=None):
+        """
+        Run hkt with the given commands, waiting for its completion, returning stdout.
 
-        args = ["--recv"]
-        args.extend(all_keyids)
-        self.run_gpg(args)
+        In case hkt returns nonzero, raises a RuntimeError that includes stderr.
+        """
+        cmd = ["/usr/bin/hkt"] + args
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        stdout, stderr = proc.communicate(input=input)
+        result = proc.wait()
+        if result != 0:
+            raise RuntimeError("{} exited with status {}: {}".format(
+                " ".join(shlex.quote(x) for x in cmd),
+                result,
+                stderr.strip()
+            ))
+        return stdout
 
-    def download_untrusted_paths(self, fpr1, fpr2):
+    def screenscrape_possibly_connecting_keys(self, fpr1, fpr2):
         """
         Screen-scrape candidate untrusted trust paths from http://pgp.cs.uu.nl/
 
-        Generate a sequence of paths, each path as a list of short keyids as given
-        by the site.
+        Returns the set of all keyids seen in the trust paths.
         """
         res = requests.get("http://pgp.cs.uu.nl/mk_path.cgi", params={
             "FROM": fpr1,
@@ -65,43 +74,97 @@ class Verify:
 
         re_keyid = re.compile("^[A-F0-9]{8}$")
 
-        all_paths = []
+        keyids = set()
         for table in page.iter("table"):
-            path = []
             for tr in table.iterfind("tr"):
                 for small in tr.iter("small"):
                     if not re_keyid.match(small.text): continue
-                    path.append(small.text)
-            if path:
-                all_paths.append(path)
+                    keyids.add(small.text)
 
-        with open(os.path.join(self.workdir, "paths.json"), "wt") as fd:
-            json.dump(all_paths, fd, indent=1)
+        return keyids
 
-        self.all_paths = all_paths
+    def compute_possibly_connecting_keys(self, wotsapdb, fpr1, fpr2):
+        """
+        Use wotsap to compute untrusted trust paths between the two keys
 
-    def load_untrusted_paths(self):
-        with open(os.path.join(self.workdir, "paths.json"), "rt") as fd:
-            self.all_paths = json.load(fd)
+        Returns the set of all keyids seen in the trust paths.
+        """
+        output = subprocess.check_output(["wotsap", "-w", wotsapdb, fpr1[-8:], fpr2[-8:]], universal_newlines=True)
+        keyids = set()
+        re_keyid = re.compile("^0x(?P<keyid>[A-F0-9]{8})\s+")
+        for line in output.splitlines():
+            mo = re_keyid.match(line)
+            if not mo: continue
+            keyids.add(mo.group("keyid"))
+
+        return keyids
+
+    def download_keys(self, keyids):
+        args = ["--recv"]
+        args.extend(keyids)
+        self.run_gpg(args)
 
     def check_paths(self, fpr1, fpr2):
-        subprocess.check_call(["hkt", "findpaths", "--keyring", os.path.join(self.workdir, "pubring.gpg"), "", fpr1, fpr2])
+        output = self.run_hkt(["findpaths", "--keyring", os.path.join(self.workdir, "pubring.gpg"), "", fpr1, fpr2])
+        return output
+
+    def graph_paths(self, keyring, fpr):
+        # Merge local keyring with user-provided one
+        keyring_pathname = os.path.join(self.workdir, "merged.gpg")
+        with open(keyring_pathname, "wb") as out:
+            if keyring is not None:
+                with open(keyring, "rb") as krin:
+                    shutil.copyfileobj(krin, out)
+            with open(os.path.join(self.workdir, "pubring.gpg"), "rb") as krin:
+                shutil.copyfileobj(krin, out)
+
+        output = self.run_hkt(["graph", "--keyring", keyring_pathname, fpr])
+        return output
+
+    def get_first_fpr_in_keyring(self, keyring):
+        output = self.run_gpg(["--with-colons", "--with-fingerprint", keyring])
+        for line in output.splitlines():
+            if not line.startswith("fpr:"): continue
+            return line.split(":")[9]
+        raise RuntimeError("Keyring {} looks empty".format(keyring))
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Verify trust paths",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("fpr1", help="starting fingerprint for trust paths")
-    parser.add_argument("fpr2", help="ending fingerprint for trust paths")
+    parser.add_argument("fpr", help="fingerprint to verify")
+    parser.add_argument("--wot", metavar="file.wot", help="use wotsap with a local .wot file")
+    parser.add_argument("--trusted-key", metavar="fpr", help="fingerprint of a key considered trusted")
+    parser.add_argument("--trusted-keyring", metavar="pathname", help="pathname of a keyring considered trusted")
     parser.add_argument("--keyserver", default="pool.sks-keyservers.net", help="keyserver to use")
+    parser.add_argument("--graph", action="store_true", help="print a graph instead of a verified trust path")
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as workdir:
         verify = Verify(workdir, keyserver=args.keyserver)
-        verify.download_untrusted_paths(args.fpr1, args.fpr2)
-        verify.recv()
-        verify.check_paths(args.fpr1, args.fpr2)
+        if args.trusted_key:
+            first_fpr = args.trusted_key
+        elif args.trusted_keyring:
+            first_fpr = verify.get_first_fpr_in_keyring(args.trusted_keyring)
+        else:
+            raise RuntimeError("please give one of --trusted-key or --trusted-keyring")
+
+        if args.wot:
+            keyids = verify.compute_possibly_connecting_keys(args.wot, first_fpr, args.fpr)
+        else:
+            keyids = verify.screenscrape_possibly_connecting_keys(first_fpr, args.fpr)
+
+        print("Download extra", keyids)
+        verify.download_keys(keyids)
+
+        if args.graph:
+            output = verify.graph_paths(args.trusted_keyring, args.fpr)
+            print(output)
+        else:
+            output = verify.check_paths(first_fpr, args.fpr)
+            print(output)
+
 
 if __name__ == "__main__":
     main()

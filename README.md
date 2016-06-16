@@ -25,3 +25,8 @@ hkt comes with ABSOLUTELY NO WARRANTY. This is free software, and you are welcom
 ```
 
 It requires [hopenpgp-tools](http://floss.scru.org/hopenpgp-tools).
+
+
+If you have [wotsap](http://www.lysator.liu.se/~jc/wotsap/index.html)
+installed, trust paths can be computed locally using the `--wot` option.
+Precompiled wotsap files can be downloaded from <https://wot.siccegge.de/>.
