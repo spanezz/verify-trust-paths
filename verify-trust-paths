@@ -163,8 +163,15 @@ def main():
             print(output)
         else:
             output = verify.check_paths(first_fpr, args.fpr)
-            print(output)
+            fprs = []
+            re_fpr = re.compile(r"\(\d,(?P<fpr>[A-F0-9]+)\)")
+            for line in output.splitlines():
+                mo = re_fpr.match(line)
+                if not mo: continue
+                fprs.append(mo.group("fpr"))
 
+            for fpr in fprs:
+                print(verify.run_gpg(["--fingerprint", fpr]))
 
 if __name__ == "__main__":
     main()
